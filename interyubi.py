@@ -252,8 +252,10 @@ def _run_with_touch_overlay(
     timeout elapses, or the task finishes — whichever comes first.  If the
     task finishes before the event fires the overlay is never shown at all.
 
-    If *ready_event* is ``None`` the function simply runs *target_fn* in the
-    background while pumping the tkinter event loop (no overlay shown).
+    If *ready_event* is ``None`` the function runs *target_fn* in the
+    background while pumping the tkinter event loop.  A time-based fallback
+    shows the overlay if the task is still running after
+    ``_TOUCH_READY_FALLBACK_S`` seconds (safety net for unexpected blocking).
 
     Any exception raised by *target_fn* is re-raised on the main thread.
     """
@@ -289,8 +291,22 @@ def _run_with_touch_overlay(
         if not result_holder["done"]:
             overlay = _show_touch_overlay()
 
-    # Pump tkinter event loop while waiting for completion
+    # Pump tkinter event loop while waiting for completion.
+    # When no ready_event was provided, use a time-based fallback: if the
+    # task is still running after _TOUCH_READY_FALLBACK_S, show the overlay
+    # as a safety net (e.g. if ykman unexpectedly blocks for touch).
+    fallback_deadline = (
+        time.monotonic() + _TOUCH_READY_FALLBACK_S
+        if ready_event is None else None
+    )
     while not result_holder["done"]:
+        if (
+            overlay is None
+            and fallback_deadline is not None
+            and time.monotonic() >= fallback_deadline
+        ):
+            logger.debug("No ready_event; task still running after fallback — showing overlay")
+            overlay = _show_touch_overlay()
         if _tk_root is not None:
             _tk_root.update()
         time.sleep(0.05)
@@ -366,9 +382,9 @@ def _handle_hotkey_trigger(force_selector: bool = False) -> None:
         except Exception:
             pass
 
-    # 1. Fetch all TOTP codes from YubiKey (background thread + touch overlay)
-    #    For a single touch-required account ykman blocks waiting for touch,
-    #    so the overlay ensures the user always sees the prompt.
+    # 1. Fetch all TOTP codes from YubiKey (background thread keeps tkinter
+    #    responsive).  If ykman takes longer than expected (e.g. blocks
+    #    waiting for touch), a fallback overlay is shown automatically.
     try:
         accounts = _run_with_touch_overlay(fetch_totp_codes)
     except YubiKeyError as e:
