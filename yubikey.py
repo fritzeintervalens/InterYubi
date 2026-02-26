@@ -114,8 +114,16 @@ def _run_ykman(*args: str) -> str:
     return result.stdout
 
 
-def fetch_totp_codes() -> list[tuple[str, Optional[str]]]:
+def fetch_totp_codes(
+    ready_event: Optional[threading.Event] = None,
+) -> list[tuple[str, Optional[str]]]:
     """Fetch all TOTP codes from the connected YubiKey.
+
+    If *ready_event* is provided it is set as soon as ykman signals that it
+    is ready for touch (by printing a prompt containing "touch" to stderr).
+    This lets the caller show a touch-prompt UI at the right moment — which
+    matters when ykman blocks inline for a single touch-required credential
+    instead of returning ``[Requires Touch]``.
 
     Returns:
         List of (account_name, code_or_none) tuples.
@@ -124,13 +132,115 @@ def fetch_totp_codes() -> list[tuple[str, Optional[str]]]:
     Raises:
         YubiKeyError: If no YubiKey is detected, ykman fails, or no accounts found.
     """
-    # Build command args, include OATH password if configured
+    ykman = _find_ykman()
     args = ["oath", "accounts", "code"]
     if CONFIG.oath_password:
         args.extend(["-p", CONFIG.oath_password])
 
-    output = _run_ykman(*args)
+    cmd = [ykman] + args
+    logger.debug("Running: %s", " ".join(cmd))
 
+    # PYTHONUNBUFFERED=1 forces ykman (a Python CLI) to flush stderr
+    # immediately so we see the touch prompt without waiting for the
+    # process to exit.
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=_CREATE_NO_WINDOW,
+            env=env,
+        )
+    except FileNotFoundError:
+        raise YubiKeyError(f"ykman executable not found at: {ykman}")
+
+    # Drain stderr in a background thread.  When the "touch" prompt
+    # appears we know ykman has sent the OATH challenge and the YubiKey
+    # is physically waiting — only then should the UI prompt the user.
+    stderr_lines: list[str] = []
+
+    def _read_stderr() -> None:
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                if ready_event is not None and "touch" in line.lower():
+                    ready_event.set()
+        except (ValueError, OSError):
+            pass  # pipe closed
+
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stderr_thread.start()
+
+    # Drain stdout in a separate thread to avoid pipe deadlocks.
+    stdout_chunks: list[str] = []
+
+    def _read_stdout() -> None:
+        try:
+            data = proc.stdout.read()
+            if data:
+                stdout_chunks.append(data)
+        except (ValueError, OSError):
+            pass
+
+    stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+    stdout_thread.start()
+
+    # Wait for the process to finish — use the longer touch timeout since
+    # ykman may block waiting for a physical touch on single-credential keys.
+    try:
+        proc.wait(timeout=TOUCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        auth_running, auth_procs = check_authenticator_running()
+        if auth_running:
+            raise YubiKeyError(
+                f"ykman timed out — Yubico Authenticator is running "
+                f"({', '.join(auth_procs)}) and may be locking the YubiKey.\n"
+                "  - Close Yubico Authenticator, then try again\n"
+                "  - The helper process (authenticator-helper.exe) may persist\n"
+                "    after closing the app — check Task Manager if the issue continues"
+            )
+        raise YubiKeyError(
+            f"ykman timed out after {TOUCH_TIMEOUT_S}s. Try:\n"
+            "  - Unplug and re-insert your YubiKey\n"
+            "  - Close Yubico Authenticator if it's open"
+        )
+
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
+
+    # Safety net: always signal ready once the process has exited so
+    # the caller never blocks indefinitely waiting for the event.
+    if ready_event is not None:
+        ready_event.set()
+
+    if proc.returncode != 0:
+        stderr_text = "".join(stderr_lines).strip().lower()
+        if "no yubikey" in stderr_text or "failed connecting" in stderr_text:
+            auth_running, auth_procs = check_authenticator_running()
+            if auth_running:
+                raise YubiKeyError(
+                    f"Cannot connect to YubiKey — Yubico Authenticator is running "
+                    f"({', '.join(auth_procs)}) and may be locking the YubiKey.\n"
+                    "  - Close Yubico Authenticator, then try again\n"
+                    "  - The helper process may linger — check Task Manager"
+                )
+            raise YubiKeyError(
+                "No YubiKey detected. Please check:\n"
+                "  - Is your YubiKey plugged in?\n"
+                "  - Try unplugging and re-inserting the key"
+            )
+        raise YubiKeyError(
+            f"ykman error: {''.join(stderr_lines).strip() or '(no error output)'}"
+        )
+
+    # Parse output
+    output = "".join(stdout_chunks)
     results: list[tuple[str, Optional[str]]] = []
     for line in output.strip().splitlines():
         # ykman output: "Issuer:Account  123456" or "Account  [Requires Touch]"

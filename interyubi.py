@@ -33,6 +33,7 @@ from yubikey import (
 )
 from selector import get_monitor_work_area, show_account_selector
 from theme import ACCENT_COLOR, SUBTEXT_COLOR, TEXT_COLOR, TITLE_BG
+from cursor_feedback import trigger_cursor_feedback
 from typing_engine import type_code
 
 logger = logging.getLogger(__name__)
@@ -373,6 +374,9 @@ def _handle_hotkey_trigger(force_selector: bool = False) -> None:
     """Called on the main thread when a hotkey event is received.
     Orchestrates: fetch codes -> select account -> type code.
     """
+    # Instant visual feedback — animated cursor runs in parallel
+    trigger_cursor_feedback()
+
     # Capture the active window title BEFORE any UI appears
     window_title = None
     if CONFIG.domain_auto_detect and not force_selector:
@@ -382,37 +386,17 @@ def _handle_hotkey_trigger(force_selector: bool = False) -> None:
         except Exception:
             pass
 
-    # --- Single-account fast path ---
-    # When the YubiKey has exactly one OATH credential, ykman's CALCULATE ALL
-    # may block waiting for touch instead of returning [Requires Touch].
-    # Detect this early with the non-blocking list command, then use
-    # fetch_code_for_account() which monitors stderr for the touch prompt.
-    try:
-        account_names = list_totp_accounts()
-    except YubiKeyError as e:
-        _show_notification(str(e))
-        return
-
-    if len(account_names) == 1 and not force_selector:
-        account_name = account_names[0]
-        logger.info("Single account detected: %s — using direct fetch", account_name)
-        touch_ready = threading.Event()
-        try:
-            code_str = _run_with_touch_overlay(
-                lambda: fetch_code_for_account(account_name, ready_event=touch_ready),
-                ready_event=touch_ready,
-            )
-        except YubiKeyError as e:
-            _show_notification(str(e))
-            return
-        type_code(code_str, delay_ms=CONFIG.type_delay_ms, auto_submit=CONFIG.auto_submit)
-        return
-
     # 1. Fetch all TOTP codes from YubiKey (background thread keeps tkinter
-    #    responsive).  If ykman takes longer than expected (e.g. blocks
-    #    waiting for touch), a fallback overlay is shown automatically.
+    #    responsive).  A ready_event lets fetch_totp_codes() signal
+    #    immediately when ykman is waiting for a physical touch — this is
+    #    critical for single-credential keys where CALCULATE ALL blocks
+    #    inline instead of returning [Requires Touch].
+    touch_ready = threading.Event()
     try:
-        accounts = _run_with_touch_overlay(fetch_totp_codes)
+        accounts = _run_with_touch_overlay(
+            lambda: fetch_totp_codes(ready_event=touch_ready),
+            ready_event=touch_ready,
+        )
     except YubiKeyError as e:
         _show_notification(str(e))
         return
