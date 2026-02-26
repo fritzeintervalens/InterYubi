@@ -374,9 +374,16 @@ def _handle_hotkey_trigger(force_selector: bool = False) -> None:
     """Called on the main thread when a hotkey event is received.
     Orchestrates: fetch codes -> select account -> type code.
     """
-    # Instant visual feedback — animated cursor runs in parallel
-    trigger_cursor_feedback()
+    # Instant visual feedback — animated cursor stays until code is typed
+    restore_cursor = trigger_cursor_feedback()
+    try:
+        _do_hotkey_trigger(force_selector)
+    finally:
+        restore_cursor()
 
+
+def _do_hotkey_trigger(force_selector: bool = False) -> None:
+    """Inner implementation of the hotkey trigger (called with cursor active)."""
     # Capture the active window title BEFORE any UI appears
     window_title = None
     if CONFIG.domain_auto_detect and not force_selector:
