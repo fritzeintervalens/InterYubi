@@ -1,0 +1,10 @@
+{
+    "hotkey": "ctrl+alt+x",
+    "selector_hotkey": null,
+    "default_account": null,
+    "type_delay_ms": 50,
+    "auto_submit": false,
+    "ykman_path": null,
+    "oath_password": null,
+    "domain_auto_detect": true
+}
