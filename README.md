@@ -14,7 +14,30 @@ winget install Yubico.YubiKeyManagerCLI
 
 Or download it from [Yubico's developer site](https://developers.yubico.com/yubikey-manager/).
 
-**A YubiKey with TOTP accounts already configured.** InterYubi reads codes from the OATH applet on your key. Use Yubico Authenticator to add accounts if you haven't set any up yet. Any YubiKey that supports OATH/TOTP will work (YubiKey 5 series, Security Key series with OATH, etc.).
+**A YubiKey with TOTP accounts already configured.** InterYubi reads codes from the OATH applet on your key. Use Yubico Authenticator to add accounts if you haven't set any up yet. See the section below for which YubiKeys support OATH.
+
+## Compatible YubiKeys
+
+InterYubi requires the OATH applet, which is only available on certain YubiKey models. FIDO-only and OTP-only keys will not work.
+
+### Supported
+
+- **YubiKey 5 Series** -- 5 NFC, 5C, 5C NFC, 5Ci, 5 Nano, 5C Nano
+- **YubiKey 5 FIPS Series** -- 5 NFC FIPS, 5C FIPS, 5C NFC FIPS, 5Ci FIPS, 5 Nano FIPS, 5C Nano FIPS
+- **YubiKey Bio - Multi-protocol Edition** -- USB-A and USB-C variants
+- **YubiKey 4 Series** (legacy) -- 4, 4C, 4 Nano, 4C Nano
+- **YubiKey NEO** (legacy) -- NEO, NEO-n
+
+### Not Supported
+
+- **Security Key Series** (all variants) -- FIDO-only, no OATH applet
+- **YubiKey Bio - FIDO Edition** -- FIDO-only, no OATH applet
+- **YubiKey Standard** (legacy) -- OTP-only
+- **YubiKey Edge** (legacy) -- OTP and U2F only
+
+### OATH Credential Capacity
+
+YubiKeys with firmware 5.7.0 or later support up to 64 OATH credentials. Older firmware supports 32. You can check your firmware version with `ykman info`.
 
 ## Getting Started
 
