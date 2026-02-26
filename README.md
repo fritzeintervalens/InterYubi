@@ -30,6 +30,8 @@ Run the tool:
 python interyubi.py
 ```
 
+If you prefer not to use the terminal, double click `InterYubi.pyw` instead. Windows runs `.pyw` files with `pythonw.exe`, so InterYubi will start directly in the system tray without a console window.
+
 InterYubi starts in the system tray. Press **Ctrl+Alt+X** on any MFA input field and the code gets typed for you.
 
 If your YubiKey has multiple TOTP accounts, domain auto detection will try to match the active browser tab to the right account. When it finds exactly one match, the code is typed immediately. When there is no match or more than one candidate, a selector popup appears near your cursor.
@@ -126,3 +128,11 @@ requirements.txt      Python dependencies
 ## License
 
 MIT. See [LICENSE](LICENSE) for the full text.
+
+---
+
+<p align="center">
+  <img src="https://intervalens.com/wp-content/uploads/2026/01/textlogo_logo_crimson.svg" alt="Intervalens" width="200">
+  <br>
+  Built by <a href="https://www.intervalens.com">Intervalens</a>
+</p>
