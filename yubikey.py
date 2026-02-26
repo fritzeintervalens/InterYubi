@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from typing import Optional
 
 from config import CONFIG, YKMAN_TIMEOUT_S, TOUCH_TIMEOUT_S
@@ -152,8 +153,46 @@ def fetch_totp_codes() -> list[tuple[str, Optional[str]]]:
     return results
 
 
-def fetch_code_for_account(account_name: str) -> str:
+def list_totp_accounts() -> list[str]:
+    """List all OATH account names on the YubiKey without computing codes.
+
+    Unlike fetch_totp_codes(), this never blocks waiting for touch because
+    it uses ``ykman oath accounts list`` instead of ``ykman oath accounts code``.
+
+    Returns:
+        List of account name strings.
+
+    Raises:
+        YubiKeyError: If no YubiKey is detected, ykman fails, or no accounts found.
+    """
+    output = _run_ykman("oath", "accounts", "list")
+
+    results: list[str] = []
+    for line in output.strip().splitlines():
+        name = line.strip()
+        if name:
+            results.append(name)
+
+    if not results:
+        raise YubiKeyError(
+            "No TOTP accounts found on the YubiKey.\n"
+            "Add accounts using Yubico Authenticator first."
+        )
+
+    logger.debug("Listed %d OATH account(s)", len(results))
+    return results
+
+
+def fetch_code_for_account(
+    account_name: str,
+    ready_event: Optional[threading.Event] = None,
+) -> str:
     """Fetch a TOTP code for a specific account (handles touch-required accounts).
+
+    If *ready_event* is provided it is set as soon as ykman signals that it
+    is ready for touch (by printing its "Touch your YubiKey..." prompt to
+    stderr).  This lets the caller delay showing a touch-prompt UI until the
+    hardware is actually waiting.
 
     Uses a longer timeout to allow time for the user to touch the YubiKey.
 
@@ -171,27 +210,81 @@ def fetch_code_for_account(account_name: str) -> str:
     cmd = [ykman] + args
     logger.debug("Fetching code for %s (touch timeout: %ds)", account_name, TOUCH_TIMEOUT_S)
 
+    # PYTHONUNBUFFERED=1 forces ykman (a Python CLI) to flush stderr
+    # immediately so we see the touch prompt without waiting for the
+    # process to exit.
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=TOUCH_TIMEOUT_S,
             creationflags=_CREATE_NO_WINDOW,
-        )
-    except subprocess.TimeoutExpired:
-        raise YubiKeyError(
-            f"Timed out waiting for touch ({TOUCH_TIMEOUT_S}s).\n"
-            "  - Make sure to touch your YubiKey when prompted"
+            env=env,
         )
     except FileNotFoundError:
         raise YubiKeyError(f"ykman executable not found at: {ykman}")
 
-    if result.returncode != 0:
-        raise YubiKeyError(f"ykman error: {result.stderr.strip()}")
+    # Drain stderr in a background thread.  When the "touch" prompt
+    # appears we know ykman has sent the OATH challenge and the YubiKey
+    # is physically waiting — only then should the UI prompt the user.
+    stderr_lines: list[str] = []
+
+    def _read_stderr() -> None:
+        try:
+            for line in proc.stderr:
+                stderr_lines.append(line)
+                if ready_event is not None and "touch" in line.lower():
+                    ready_event.set()
+        except (ValueError, OSError):
+            pass  # pipe closed
+
+    stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+    stderr_thread.start()
+
+    # Drain stdout in a separate thread to avoid pipe deadlocks.
+    stdout_chunks: list[str] = []
+
+    def _read_stdout() -> None:
+        try:
+            data = proc.stdout.read()
+            if data:
+                stdout_chunks.append(data)
+        except (ValueError, OSError):
+            pass
+
+    stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
+    stdout_thread.start()
+
+    # Wait for the process to finish — this is the timeout boundary.
+    try:
+        proc.wait(timeout=TOUCH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise YubiKeyError(
+            f"Timed out waiting for touch ({TOUCH_TIMEOUT_S}s).\n"
+            "  - Make sure to touch your YubiKey when prompted"
+        )
+
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
+
+    # Safety net: always signal ready once the process has exited so
+    # the caller never blocks indefinitely waiting for the event.
+    if ready_event is not None:
+        ready_event.set()
+
+    if proc.returncode != 0:
+        stderr_text = "".join(stderr_lines).strip()
+        raise YubiKeyError(f"ykman error: {stderr_text or '(no error output)'}")
 
     # Parse the code from output
-    for line in result.stdout.strip().splitlines():
+    stdout = "".join(stdout_chunks)
+    for line in stdout.strip().splitlines():
         match = re.match(r"^(.+?)\s{2,}(\d{6,8})\s*$", line)
         if match:
             return match.group(2)

@@ -29,6 +29,7 @@ from yubikey import (
     check_ykman_available,
     fetch_code_for_account,
     fetch_totp_codes,
+    list_totp_accounts,
 )
 from selector import get_monitor_work_area, show_account_selector
 from theme import ACCENT_COLOR, SUBTEXT_COLOR, TEXT_COLOR, TITLE_BG
@@ -51,6 +52,10 @@ _tk_root: Optional[tk.Tk] = None
 
 # Debounce tracking
 _last_trigger_time: float = 0.0
+
+# If ykman's stderr prompt hasn't arrived after this many seconds, show the
+# touch overlay anyway (safety net for buffered or missing stderr output).
+_TOUCH_READY_FALLBACK_S: float = 3.0
 
 # Hotkey hook IDs for re-registration
 _hotkey_id: Optional[int] = None
@@ -236,6 +241,73 @@ def _show_touch_overlay() -> Optional[tk.Toplevel]:
         return None
 
 
+def _run_with_touch_overlay(
+    target_fn,
+    ready_event: Optional[threading.Event] = None,
+):
+    """Run *target_fn* in a background thread, optionally showing a touch overlay.
+
+    If *ready_event* is provided the overlay is deferred until the event is
+    set (meaning ykman is actually waiting for a physical touch), a fallback
+    timeout elapses, or the task finishes — whichever comes first.  If the
+    task finishes before the event fires the overlay is never shown at all.
+
+    If *ready_event* is ``None`` the function simply runs *target_fn* in the
+    background while pumping the tkinter event loop (no overlay shown).
+
+    Any exception raised by *target_fn* is re-raised on the main thread.
+    """
+    result_holder: dict = {"value": None, "error": None, "done": False}
+
+    def _bg() -> None:
+        try:
+            result_holder["value"] = target_fn()
+        except Exception as exc:
+            result_holder["error"] = exc
+        finally:
+            result_holder["done"] = True
+
+    thread = threading.Thread(target=_bg, daemon=True)
+    thread.start()
+
+    overlay = None
+
+    if ready_event is not None:
+        # Wait for the touch-ready signal, task completion, or fallback
+        # timeout — whichever comes first.  Pump tkinter in the meantime.
+        deadline = time.monotonic() + _TOUCH_READY_FALLBACK_S
+        while not result_holder["done"] and not ready_event.is_set():
+            if time.monotonic() >= deadline:
+                logger.debug("Touch-ready fallback timeout reached, showing overlay")
+                break
+            if _tk_root is not None:
+                _tk_root.update()
+            time.sleep(0.05)
+
+        # Only show the overlay if the task is still running (i.e. ykman
+        # is actually waiting for touch).
+        if not result_holder["done"]:
+            overlay = _show_touch_overlay()
+
+    # Pump tkinter event loop while waiting for completion
+    while not result_holder["done"]:
+        if _tk_root is not None:
+            _tk_root.update()
+        time.sleep(0.05)
+
+    # Clean up overlay
+    if overlay is not None:
+        try:
+            overlay.destroy()
+        except tk.TclError:
+            pass
+
+    if result_holder["error"] is not None:
+        raise result_holder["error"]
+
+    return result_holder["value"]
+
+
 # --- Account resolution ---
 
 def _resolve_account(accounts: list[tuple[str, str]]) -> Optional[int]:
@@ -294,9 +366,11 @@ def _handle_hotkey_trigger(force_selector: bool = False) -> None:
         except Exception:
             pass
 
-    # 1. Fetch all TOTP codes from YubiKey
+    # 1. Fetch all TOTP codes from YubiKey (background thread + touch overlay)
+    #    For a single touch-required account ykman blocks waiting for touch,
+    #    so the overlay ensures the user always sees the prompt.
     try:
-        accounts = fetch_totp_codes()
+        accounts = _run_with_touch_overlay(fetch_totp_codes)
     except YubiKeyError as e:
         _show_notification(str(e))
         return
@@ -331,42 +405,18 @@ def _handle_hotkey_trigger(force_selector: bool = False) -> None:
     # 5. Get the code — either already fetched or needs touch
     account_name, code_str = accounts[selected_idx]
     if code_str is None:
-        # Touch-required: show overlay window + tray notification, fetch in background
-        _show_notification("Touch your YubiKey...", title="InterYubi")
+        # Touch-required: fetch code with overlay deferred until ykman is
+        # actually ready for touch (so touching too early doesn't get lost).
         logger.info("Waiting for touch on %s...", account_name)
-        overlay = _show_touch_overlay()
-
-        # Run the blocking ykman subprocess in a background thread so the
-        # tkinter event loop stays alive and the overlay remains visible.
-        result_holder: dict = {"code": None, "error": None, "done": False}
-
-        def _bg_fetch() -> None:
-            try:
-                result_holder["code"] = fetch_code_for_account(account_name)
-            except YubiKeyError as exc:
-                result_holder["error"] = exc
-            finally:
-                result_holder["done"] = True
-
-        fetch_thread = threading.Thread(target=_bg_fetch, daemon=True)
-        fetch_thread.start()
-
-        # Pump the tkinter event loop while waiting so the overlay stays rendered
-        while not result_holder["done"]:
-            _tk_root.update()
-            time.sleep(0.05)
-
-        # Clean up overlay
-        if overlay is not None:
-            try:
-                overlay.destroy()
-            except tk.TclError:
-                pass
-
-        if result_holder["error"] is not None:
-            _show_notification(str(result_holder["error"]))
+        try:
+            touch_ready = threading.Event()
+            code_str = _run_with_touch_overlay(
+                lambda: fetch_code_for_account(account_name, ready_event=touch_ready),
+                ready_event=touch_ready,
+            )
+        except YubiKeyError as e:
+            _show_notification(str(e))
             return
-        code_str = result_holder["code"]
 
     # 6. Type the code into the focused input field
     type_code(code_str, delay_ms=CONFIG.type_delay_ms, auto_submit=CONFIG.auto_submit)
@@ -526,10 +576,12 @@ def _startup_checks() -> None:
         logger.info("[OK] No Yubico Authenticator conflict detected")
 
     # Check YubiKey presence (non-fatal — user might plug it in later)
+    # Uses list_totp_accounts() instead of fetch_totp_codes() to avoid
+    # blocking on touch-required accounts at startup.
     try:
-        accounts = fetch_totp_codes()
-        logger.info("[OK] YubiKey detected — %d TOTP account(s)", len(accounts))
-        for name, _ in accounts:
+        account_names = list_totp_accounts()
+        logger.info("[OK] YubiKey detected — %d TOTP account(s)", len(account_names))
+        for name in account_names:
             logger.info("     - %s", name)
     except YubiKeyError as e:
         logger.warning("[--] YubiKey: %s (will retry on hotkey press)", e)
