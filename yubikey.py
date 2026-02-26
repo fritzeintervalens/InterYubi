@@ -165,7 +165,10 @@ def list_totp_accounts() -> list[str]:
     Raises:
         YubiKeyError: If no YubiKey is detected, ykman fails, or no accounts found.
     """
-    output = _run_ykman("oath", "accounts", "list")
+    args = ["oath", "accounts", "list"]
+    if CONFIG.oath_password:
+        args.extend(["-p", CONFIG.oath_password])
+    output = _run_ykman(*args)
 
     results: list[str] = []
     for line in output.strip().splitlines():
